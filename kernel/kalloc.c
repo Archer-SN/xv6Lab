@@ -9,10 +9,14 @@
 #include "riscv.h"
 #include "defs.h"
 
+// TODO: Kernel freezes on boot. Definitely has something to do with lock
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
+int *rcl; // Page entry reference count list
+int rcl_size;
 
 struct run {
   struct run *next;
@@ -35,8 +39,12 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
+  rcl_size = (((char *)pa_end - p) + PGSIZE - 1) / PGSIZE;
+  int count_list[rcl_size];
+  rcl = count_list;
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
+
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -51,15 +59,24 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
   r = (struct run*)pa;
+  int i = rcl_size - (PHYSTOP - PGROUNDUP((uint64)pa)) / PGSIZE;
+  bool filljunk = false;
 
   acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
+  rcl[i] -= 1;
+  if (rcl[i] <= 0) {
+    filljunk = true;
+    rcl[i] = 0;
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+  }
   release(&kmem.lock);
+
+  if (filljunk) {
+    // Fill with junk to catch dangling refs.
+    memset(pa, 1, PGSIZE);
+  }
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -69,14 +86,27 @@ void *
 kalloc(void)
 {
   struct run *r;
-
+  
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  
+  int i = rcl_size - (PHYSTOP - PGROUNDUP((uint64)r)) / PGSIZE;
+  if(r) {
+    rcl[i] = 1;
     kmem.freelist = r->next;
+  }
   release(&kmem.lock);
-
+  
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
-  return (void*)r;
+return (void*)r;
+}
+
+// Add a reference count
+void kreference(void *pa) {
+  int i = rcl_size - (PHYSTOP - PGROUNDUP((uint64)pa)) / PGSIZE;
+  
+  acquire(&kmem.lock);
+  rcl[i] += 1;
+  release(&kmem.lock);
 }
